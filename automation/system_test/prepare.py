@@ -13,997 +13,390 @@
 # limitations under the License.
 #
 
-import datetime
+import base64
 import json
-import logging
-import os
-import pathlib
-import shutil
 import subprocess
-import sys
-import tempfile
-import time
-import typing
-import urllib.parse
 
-import boto3
 import click
-import paramiko
-import yaml
 
 
-class Logger:
-    def __init__(self, name, **kwargs):
-        self._logger = logging.getLogger(name)
-        level = kwargs.get("level", logging.INFO)
-        self._logger.setLevel(level)
-        if not self._logger.handlers:
-            ch = logging.StreamHandler()
-            formatter = logging.Formatter(
-                "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-            )
-            ch.setFormatter(formatter)
-            self._logger.addHandler(ch)
-
-    def log(self, level: str, message: str, **kwargs: typing.Any) -> None:
-        more = f": {kwargs}" if kwargs else ""
-        self._logger.log(logging.getLevelName(level.upper()), f"{message}{more}")
+def run_click_command(command, **kwargs):
+    """
+    Runs a click command with the specified arguments.
+    :param command: The click command to run.
+    :param kwargs: Keyword arguments to pass to the click command.
+    """
+    # create a Click context object
+    ctx = click.Context(command)
+    # invoke the Click command with the desired arguments
+    ctx.invoke(command, **kwargs)
 
 
-project_dir = pathlib.Path(__file__).resolve().parent.parent.parent
-logger = Logger(level=logging.DEBUG, name="automation")
-logging.getLogger("paramiko").setLevel(logging.DEBUG)
+def get_installed_releases(namespace):
+    cmd = ["helm", "ls", "-n", namespace, "--deployed", "--short"]
+    output = subprocess.check_output(cmd).decode("utf-8")
+    release_names = output.strip().split("\n")
+    return release_names
 
 
-class SystemTestPreparer:
-    class Constants:
-        ci_dir_name = "mlrun-automation"
-        homedir = pathlib.Path("/home/iguazio/")
-        workdir = homedir / ci_dir_name
-        igz_version_file = homedir / "igz" / "version.txt"
-        mlrun_code_path = workdir / "mlrun"
-        provctl_path = workdir / "provctl"
-        system_tests_env_yaml = (
-            project_dir / pathlib.Path("tests") / "system" / "env.yml"
+def run_command(cmd):
+    """
+    Runs a shell command and returns its output and exit status.
+    """
+    result = subprocess.run(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True
+    )
+    return result.stdout.decode("utf-8"), result.returncode
+
+
+def create_ingress_resource(domain_name, ipadd):
+    # Replace the placeholder string with the actual domain name
+    yaml_manifest = """
+    apiVersion: networking.k8s.io/v1
+    kind: Ingress
+    metadata:
+      annotations:
+        nginx.ingress.kubernetes.io/auth-cache-duration: 200 202 5m, 401 30s
+        nginx.ingress.kubernetes.io/auth-cache-key: $host$http_x_remote_user$http_cookie$http_authorization
+        nginx.ingress.kubernetes.io/proxy-body-size: "0"
+        nginx.ingress.kubernetes.io/whitelist-source-range: "{}"
+        nginx.ingress.kubernetes.io/service-upstream: "true"
+        nginx.ingress.kubernetes.io/ssl-redirect: "false"
+      labels:
+        release: redisinsight
+      name: redisinsight
+      namespace: devtools
+    spec:
+      ingressClassName: nginx
+      rules:
+      - host: {}
+        http:
+          paths:
+          - backend:
+              service:
+                name: redisinsight
+                port:
+                  number: 80
+            path: /
+            pathType: ImplementationSpecific
+      tls:
+      - hosts:
+        - {}
+        secretName: ingress-tls
+    """.format(
+        ipadd, domain_name, domain_name
+    )
+    subprocess.run(
+        ["kubectl", "apply", "-f", "-"], input=yaml_manifest.encode(), check=True
+    )
+
+
+def get_ingress_controller_version():
+    # Run the kubectl command and capture its output
+    kubectl_cmd = "kubectl"
+    namespace = "default-tenant"
+    grep_cmd = "grep shell.default-tenant"
+    awk_cmd1 = "awk '{print $3}'"
+    awk_cmd2 = "awk -F shell.default-tenant '{print $2}'"
+    cmd = f"{kubectl_cmd} get ingress -n {namespace} | {grep_cmd} | {awk_cmd1} | {awk_cmd2}"
+    result = subprocess.run(
+        cmd, shell=True, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+    )
+    return result.stdout.decode("utf-8").strip()
+
+
+def get_svc_password(namespace, service_name, key):
+    cmd = f'kubectl get secret --namespace {namespace} {service_name} -o jsonpath="{{.data.{key}}}" | base64 --decode'
+    result = subprocess.run(
+        cmd, shell=True, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+    )
+    return result.stdout.decode("utf-8").strip()
+
+
+def print_svc_info(svc_host, svc_port, svc_username, svc_password, nodeport):
+    print(f"Service is running at {svc_host}:{svc_port}")
+    print(f"Service username: {svc_username}")
+    print(f"Service password: {svc_password}")
+    print(f"service nodeport: {nodeport}")
+
+
+def check_redis_installation():
+    cmd = "helm ls -A | grep -w redis | awk '{print $1}' | wc -l"
+    result = subprocess.check_output(cmd, shell=True)
+    return result.decode("utf-8").strip()
+
+
+def add_repos():
+    repos = {"bitnami": "https://charts.bitnami.com/bitnami"}
+    for repo, url in repos.items():
+        cmd = f"helm repo add {repo} {url}"
+        subprocess.run(cmd.split(), check=True)
+
+
+def install_redisinsight(ipadd):
+    print(check_redis_installation)
+    if check_redis_installation() == "1":
+        subprocess.run(["rm", "-rf", "redisinsight-chart-0.1.0.tgz*"])
+        chart_url = "https://docs.redis.com/latest/pkgs/redisinsight-chart-0.1.0.tgz"
+        chart_file = "redisinsight-chart-0.1.0.tgz"
+        subprocess.run(["wget", chart_url])
+        # get redis password
+        redis_password = subprocess.check_output(
+            [
+                "kubectl",
+                "get",
+                "secret",
+                "--namespace",
+                "devtools",
+                "redis",
+                "-o",
+                'jsonpath="{.data.redis-password}"',
+            ],
+            encoding="utf-8",
+        ).strip('"\n')
+        redis_password = base64.b64decode(redis_password).decode("utf-8")
+        cmd = [
+            "helm",
+            "install",
+            "redisinsight",
+            chart_file,
+            "--set",
+            "redis.url=redis-master",
+            "--set",
+            "master.service.nodePort=6379",
+            "--set",
+            f"auth.password={redis_password}",
+            "--set",
+            "fullnameOverride=redisinsight",
+            "--namespace",
+            "devtools",
+        ]
+        subprocess.run(cmd, check=True)
+        # run patch cmd
+        fqdn = get_ingress_controller_version()
+        full_domain = "redisinsight" + fqdn
+        create_ingress_resource(full_domain, ipadd)
+        deployment_name = "redisinsight"
+        container_name = "redisinsight-chart"
+        env_name = "RITRUSTEDORIGINS"
+        full_domain = full_domain
+        pfull_domain = "https://" + full_domain
+        patch_command = (
+            f'kubectl patch deployment -n devtools {deployment_name} -p \'{{"spec":{{"template":{{"spec":{{'
+            f'"containers":[{{"name":"{container_name}","env":[{{"name":"{env_name}","value":"'
+            f"{pfull_domain}\"}}]}}]}}}}}}}}'"
         )
-        namespace = "default-tenant"
+        subprocess.run(patch_command, shell=True)
+        clean_command = "rm -rf redisinsight-chart-0.1.0.tgz*"
+        subprocess.run(clean_command, shell=True)
+    else:
+        print("redis is not install, please install redis first")
+        exit()
 
-        git_url = "https://github.com/mlrun/mlrun.git"
 
-    def __init__(
-        self,
-        mlrun_version: str = None,
-        mlrun_commit: str = None,
-        override_image_registry: str = None,
-        override_image_repo: str = None,
-        override_mlrun_images: str = None,
-        data_cluster_ip: str = None,
-        data_cluster_ssh_username: str = None,
-        data_cluster_ssh_password: str = None,
-        app_cluster_ssh_password: str = None,
-        github_access_token: str = None,
-        provctl_download_url: str = None,
-        provctl_download_s3_access_key: str = None,
-        provctl_download_s3_key_id: str = None,
-        mlrun_dbpath: str = None,
-        username: str = None,
-        access_key: str = None,
-        iguazio_version: str = None,
-        slack_webhook_url: str = None,
-        mysql_user: str = None,
-        mysql_password: str = None,
-        purge_db: bool = False,
-        debug: bool = False,
-        branch: str = None,
-    ):
-        self._logger = logger
-        self._debug = debug
-        self._mlrun_version = mlrun_version
-        self._mlrun_commit = mlrun_commit
-        self._override_image_registry = (
-            override_image_registry.strip().strip("/") + "/"
-            if override_image_registry is not None
-            else override_image_registry
+@click.command()
+@click.option("--redis", is_flag=True, help="Install Redis")
+@click.option("--kafka", is_flag=True, help="Install Kafka")
+@click.option("--mysql", is_flag=True, help="Install MySQL")
+@click.option("--redisinsight", is_flag=True, help="Install Redis GUI")
+@click.option("--ipadd", default="localhost", help="IP address as string")
+def install(redis, kafka, mysql, redisinsight, ipadd):
+    # Check if the local-path storage class exists
+    output, exit_code = run_command(
+        "kubectl get storageclass local-path >/dev/null 2>&1"
+    )
+    if exit_code != 0:
+        # Install the local-path provisioner
+        cmd = (
+            "kubectl apply -f https://raw.githubusercontent.com/rancher/local-path-provisioner/v0.0.24/deploy/local"
+            "-path-storage.yaml"
         )
-        self._override_image_repo = override_image_repo
-        self._override_mlrun_images = override_mlrun_images
-        self._data_cluster_ip = data_cluster_ip
-        self._data_cluster_ssh_username = data_cluster_ssh_username
-        self._data_cluster_ssh_password = data_cluster_ssh_password
-        self._app_cluster_ssh_password = app_cluster_ssh_password
-        self._provctl_download_url = provctl_download_url
-        self._provctl_download_s3_access_key = provctl_download_s3_access_key
-        self._provctl_download_s3_key_id = provctl_download_s3_key_id
-        self._iguazio_version = iguazio_version
-        self._mysql_user = mysql_user
-        self._mysql_password = mysql_password
-        self._purge_db = purge_db
-        self._ssh_client: typing.Optional[paramiko.SSHClient] = None
-
-        self._env_config = {
-            "MLRUN_DBPATH": mlrun_dbpath,
-            "V3IO_USERNAME": username,
-            "V3IO_ACCESS_KEY": access_key,
-            "MLRUN_SYSTEM_TESTS_SLACK_WEBHOOK_URL": slack_webhook_url,
-            "MLRUN_SYSTEM_TESTS_BRANCH": branch,
-            # Setting to MLRUN_SYSTEM_TESTS_GIT_TOKEN instead of GIT_TOKEN, to not affect tests which doesn't need it
-            # (e.g. tests which use public repos, therefor doesn't need that access token)
-            "MLRUN_SYSTEM_TESTS_GIT_TOKEN": github_access_token,
-        }
-
-    def prepare_local_env(self, save_to_path: str = ""):
-        self._prepare_env_local(save_to_path)
-
-    def connect_to_remote(self):
-        if not self._debug and self._data_cluster_ip:
-            self._logger.log(
-                "info",
-                "Connecting to data-cluster",
-                data_cluster_ip=self._data_cluster_ip,
+        output, exit_code = run_command(cmd)
+        if exit_code == 0:
+            # Set the local-path storage class as the default
+            cmd = (
+                'kubectl patch storageclass local-path -p \'{"metadata": {"annotations":{'
+                '"storageclass.kubernetes.io/is-default-class":"true"}}}\''
             )
-            self._ssh_client = paramiko.SSHClient()
-            self._ssh_client.set_missing_host_key_policy(paramiko.WarningPolicy)
-            self._ssh_client.connect(
-                self._data_cluster_ip,
-                username=self._data_cluster_ssh_username,
-                password=self._data_cluster_ssh_password,
-            )
-
-    def run(self):
-        self.connect_to_remote()
-
-        try:
-            logger.log("debug", "installing dev utilities")
-            self._install_dev_utilities()
-            logger.log("debug", "installing dev utilities - done")
-        except Exception as exp:
-            self._logger.log(
-                "error", "error on install dev utilities", exception=str(exp)
-            )
-
-        # for sanity clean up before starting the run
-        self.clean_up_remote_workdir()
-
-        self._prepare_env_remote()
-
-        self._resolve_iguazio_version()
-
-        self._download_provctl()
-
-        self._override_mlrun_api_env()
-
-        # purge of the database needs to be executed before patching mlrun so that the mlrun migrations
-        # that run as part of the patch would succeed even if we move from a newer version to an older one
-        # e.g from development branch which is (1.4.0) and has a newer alembic revision than 1.3.x which is (1.3.1)
-        if self._purge_db:
-            self._purge_mlrun_db()
-
-        self._patch_mlrun()
-
-    def clean_up_remote_workdir(self):
-        self._logger.log(
-            "info", "Cleaning up remote workdir", workdir=str(self.Constants.workdir)
-        )
-        self._run_command(
-            f"rm -rf {self.Constants.workdir}", workdir=str(self.Constants.homedir)
-        )
-
-    def _run_command(
-        self,
-        command: str,
-        args: list = None,
-        workdir: str = None,
-        stdin: str = None,
-        live: bool = True,
-        suppress_errors: bool = False,
-        local: bool = False,
-        detach: bool = False,
-        verbose: bool = True,
-        suppress_error_strings: list = None,
-    ) -> (bytes, bytes):
-        workdir = workdir or str(self.Constants.workdir)
-        stdout, stderr, exit_status = "", "", 0
-        suppress_error_strings = suppress_error_strings or []
-
-        log_command_location = "locally" if local else "on data cluster"
-
-        # ssh session might not be active if the command reran due retry mechanism on a connection failure
-        if not local:
-            self._ensure_ssh_session_active()
-
-        if verbose:
-            self._logger.log(
-                "debug",
-                f"Running command {log_command_location}",
-                command=command,
-                args=args,
-                stdin=stdin,
-                workdir=workdir,
-            )
-        if self._debug:
-            return b"", b""
-        try:
-            if local:
-                stdout, stderr, exit_status = run_command(
-                    command, args, workdir, stdin, live
+            output, exit_code = run_command(cmd)
+            if exit_code == 0:
+                print(
+                    "local-path storage class has been installed and set as the default."
                 )
             else:
-                stdout, stderr, exit_status = self._run_command_remotely(
-                    command,
-                    args,
-                    workdir,
-                    stdin,
-                    live,
-                    detach,
-                    verbose,
-                )
-            if exit_status != 0 and not suppress_errors:
-                for suppress_error_string in suppress_error_strings:
-                    if suppress_error_string in str(stderr):
-                        self._logger.log(
-                            "warning",
-                            "Suppressing error",
-                            stderr=stderr,
-                            suppress_error_string=suppress_error_string,
-                        )
-                        break
-                else:
-                    raise RuntimeError(
-                        f"Command failed with exit status: {exit_status}"
-                    )
-
-        except (paramiko.SSHException, RuntimeError) as exc:
-            err_log_kwargs = {
-                "error": str(exc),
-                "stdout": stdout,
-                "stderr": stderr,
-                "exit_status": exit_status,
-            }
-            if verbose:
-                err_log_kwargs["command"] = command
-
-            self._logger.log(
-                "error",
-                f"Failed running command {log_command_location}",
-                **err_log_kwargs,
-            )
-            raise
+                print(f"Error setting local-path storage class as default: {output}")
         else:
-            if verbose:
-                self._logger.log(
-                    "debug",
-                    f"Successfully ran command {log_command_location}",
-                    command=command,
-                    stdout=stdout,
-                    stderr=stderr,
-                    exit_status=exit_status,
-                )
-            return stdout, stderr
+            print(f"Error installing local-path storage class: {output}")
+    else:
+        print("local-path storage class already exists.")
+    services = {
+        "redis": {
+            "chart": "bitnami/redis",
+            "set_values": "--set master.service.nodePorts.redis=30222 --set master.service.type=NodePort",
+        },
+        "kafka": {
+            "chart": "bitnami/kafka",
+            "set_values": "--set service.nodePorts.client=31002",
+        },
+        "mysql": {
+            "chart": "bitnami/mysql",
+            "set_values": "--set primary.service.nodePorts.mysql=30223 --set primary.service.type=NodePort --set networkPolicy.enabled=true",
+        },
+    }
+    namespace = "devtools"
+    # Add Helm repos
+    add_repos()
+    # Check if the namespace exists, if not create it
+    check_namespace_cmd = f"kubectl get namespace {namespace}"
+    try:
+        subprocess.run(check_namespace_cmd.split(), check=True)
+    except subprocess.CalledProcessError:
+        create_namespace_cmd = f"kubectl create namespace {namespace}"
+        subprocess.run(create_namespace_cmd.split(), check=True)
+    for service, data in services.items():
+        if locals().get(service):
+            chart = data["chart"]
+            set_values = data["set_values"]
+            cmd = f"helm install {service} {chart} {set_values} --namespace {namespace}"
+            print(cmd)
+            subprocess.run(cmd.split(), check=True)
+    if redisinsight:
+        install_redisinsight(ipadd)
 
-    def _run_command_remotely(
-        self,
-        command: str,
-        args: list = None,
-        workdir: str = None,
-        stdin: str = None,
-        live: bool = True,
-        detach: bool = False,
-        verbose: bool = True,
-    ) -> (str, str, int):
-        workdir = workdir or self.Constants.workdir
-        stdout, stderr, exit_status = "", "", 0
 
-        command = f"cd {workdir}; " + command
-        if args:
-            command += " " + " ".join(args)
+@click.command()
+@click.option("--redis", is_flag=True, help="Uninstall Redis")
+@click.option("--kafka", is_flag=True, help="Uninstall Kafka")
+@click.option("--mysql", is_flag=True, help="Uninstall MySQL")
+@click.option("--redisinsight", is_flag=True, help="Uninstall Redis GUI")
+def uninstall(redis, kafka, mysql, redisinsight):
+    services = ["redis", "kafka", "mysql", "redisinsight"]
+    namespace = "devtools"
+    try:
+        if redisinsight:
+            cmd = "kubectl delete ingress -n devtools redisinsight"
+            subprocess.run(cmd.split(), check=True)
+    except Exception as e:
+        print(e)
+    try:
+        for service in services:
+            if locals().get(service):
+                cmd = f"helm uninstall {service} --namespace {namespace}"
+                subprocess.run(cmd.split(), check=True)
+    except Exception as e:
+        print(e)
+    try:
+        print("namespace deleteted")
+        cmd = "kubectl delete namespace  devtools"
+        subprocess.run(cmd.split(), check=True)
+    except Exception as e:  # !!!
+        print(e)
+        pass
+        # code to handle any exception
 
-        if detach:
-            command = f"screen -d -m bash -c '{command}'"
-            if verbose:
-                self._logger.log(
-                    "debug", "running command in detached mode", command=command
-                )
 
-        stdin_stream, stdout_stream, stderr_stream = self._ssh_client.exec_command(
-            command
-        )
+@click.command()
+def list_services():
+    namespace = "devtools"
+    # for service in services:
+    cmd = f"helm ls  --namespace {namespace} "
+    subprocess.run(cmd.split(), check=True)
 
-        if stdin:
-            stdin_stream.write(stdin)
-            stdin_stream.close()
 
-        if live:
-            while True:
-                line = stdout_stream.readline()
-                stdout += line
-                if not line:
-                    break
-                print(line, end="")
-        else:
-            stdout = stdout_stream.read()
+def list_services_h():
+    namespace = "devtools"
+    return get_installed_releases(namespace)
 
-        stderr = stderr_stream.read()
 
-        exit_status = stdout_stream.channel.recv_exit_status()
-
-        return stdout, stderr, exit_status
-
-    def _prepare_env_remote(self):
-        self._run_command(
-            "mkdir",
-            args=["-p", str(self.Constants.workdir)],
-            workdir=str(self.Constants.homedir),
-        )
-
-    def _prepare_env_local(self, save_to_path: str = ""):
-        filepath = save_to_path or str(self.Constants.system_tests_env_yaml)
-        backup_filepath = str(self.Constants.system_tests_env_yaml) + ".bak"
-        self._logger.log("debug", "Populating system tests env.yml", filepath=filepath)
-
-        # if filepath exists, backup the file first (to avoid overriding it)
-        if os.path.isfile(filepath) and not os.path.isfile(backup_filepath):
-            self._logger.log(
-                "debug", "Backing up existing env.yml", destination=backup_filepath
+@click.command()
+@click.option("--redis", is_flag=True, help="Get Redis info")
+@click.option("--kafka", is_flag=True, help="Get Kafka info")
+@click.option("--mysql", is_flag=True, help="Get MySQL info")
+@click.option("--redisinsight", is_flag=True, help="Get Redis GUI info")
+@click.option("--output", default="human", type=click.Choice(["human", "json"]))
+def status(redis, kafka, mysql, redisinsight, output):
+    namespace = "devtools"
+    get_all_output = {}
+    if redis:
+        svc_password = get_svc_password(namespace, "redis", "redis-password")
+        get_all_output["redis"] = status_h("redis")
+        if output == "human":
+            fqdn = get_ingress_controller_version()
+            full_domain = "redis-master" + fqdn
+            print_svc_info(
+                full_domain,
+                30222,
+                "default",
+                svc_password,
+                "-------",
             )
-            shutil.copy(filepath, backup_filepath)
+    if kafka:
+        get_all_output["kafka"] = status_h("kafka")
+        if output == "human":
+            print_svc_info("kafka", 9092, "-------", "-------", "-------")
+    if mysql:
+        fqdn = get_ingress_controller_version()
+        full_domain = "mysql" + fqdn
+        svc_password = get_svc_password(namespace, "mysql", "mysql-root-password")
+        get_all_output["mysql"] = status_h("mysql")
+        if output == "human":
+            print_svc_info(full_domain, 30223, "root", svc_password, "-------")
+    if redisinsight:
+        get_all_output["redisinsight"] = status_h("redisinsight")
+        if output == "human":
+            print_svc_info(
+                "",
+                " " + get_all_output["redisinsight"]["app_url"],
+                "-------",
+                "-------",
+                "-------",
+            )
 
-        # enrichment can be done only if ssh client is initialized
-        if self._ssh_client:
-            self._enrich_env()
-        serialized_env_config = self._serialize_env_config()
-        with open(filepath, "w") as f:
-            f.write(serialized_env_config)
+    if output == "json":
+        print(json.dumps(get_all_output))
 
-    def _override_mlrun_api_env(self):
-        version_specifier = (
-            f"mlrun[complete] @ git+https://github.com/mlrun/mlrun@{self._mlrun_commit}"
-            if self._mlrun_commit
-            else "mlrun[complete]"
-        )
-        data = {
-            "MLRUN_HTTPDB__BUILDER__MLRUN_VERSION_SPECIFIER": version_specifier,
-            # Disable the scheduler minimum allowed interval to allow fast tests (default minimum is 10 minutes, which
-            # will make our tests really long)
-            "MLRUN_HTTPDB__SCHEDULING__MIN_ALLOWED_INTERVAL": "0 Seconds",
-            # to allow batch_function to have parquet files sooner
-            "MLRUN_MODEL_ENDPOINT_MONITORING__PARQUET_BATCHING_MAX_EVENTS": "100",
+
+def status_h(svc):
+    namespace = "devtools"
+    if svc == "redis":
+        fqdn = get_ingress_controller_version()
+        full_domain = "redis-master" + fqdn + ":30222"
+        svc_password = get_svc_password(namespace, "redis", "redis-password")
+        dict = {
+            "app_url": "redis-master-0.redis-headless.devtools.svc.cluster.local:6379",
+            "username": "default",
+            "password": svc_password,
         }
-        if self._override_image_registry:
-            data["MLRUN_IMAGES_REGISTRY"] = f"{self._override_image_registry}"
-        override_mlrun_registry_manifest = {
-            "apiVersion": "v1",
-            "data": data,
-            "kind": "ConfigMap",
-            "metadata": {
-                "name": "mlrun-override-env",
-                "namespace": self.Constants.namespace,
-            },
+        return dict
+    if svc == "kafka":
+        dict = {"app_url": "kafka-0.kafka-headless.devtools.svc.cluster.local:9092"}
+        return dict
+    if svc == "mysql":
+        fqdn = get_ingress_controller_version()
+        full_domain = "mysql" + fqdn + ":30223"
+        svc_password = get_svc_password(namespace, "mysql", "mysql-root-password")
+        dict = {
+            "app_url": full_domain,
+            "username": "root",
+            "password": svc_password,
         }
-        manifest_file_name = "override_mlrun_registry.yml"
-        self._run_command(
-            "cat > ",
-            args=[manifest_file_name],
-            stdin=yaml.safe_dump(override_mlrun_registry_manifest),
-        )
-
-        self._run_command(
-            "kubectl",
-            args=["apply", "-f", manifest_file_name],
-        )
-
-    def _enrich_env(self):
-        devutils_outputs = self._get_devutils_status()
-        if "redis" in devutils_outputs:
-            self._logger.log("debug", "Enriching env with redis info")
-            # uncomment when url is accessible from outside the cluster
-            # self._env_config["MLRUN_REDIS__URL"] = f"redis://{devutils_outputs['redis']['app_url']}"
-            # self._env_config["REDIS_USER"] = devutils_outputs["redis"]["username"]
-            # self._env_config["REDIS_PASSWORD"] = devutils_outputs["redis"]["password"]
-
-        api_url_host = self._get_ingress_host("datanode-dashboard")
-        framesd_host = self._get_ingress_host("framesd")
-        v3io_api_host = self._get_ingress_host("webapi")
-        spark_service_name = self._get_service_name("app=spark,component=spark-master")
-        self._env_config["MLRUN_IGUAZIO_API_URL"] = f"https://{api_url_host}"
-        self._env_config["V3IO_FRAMESD"] = f"https://{framesd_host}"
-        self._env_config[
-            "MLRUN_SYSTEM_TESTS_DEFAULT_SPARK_SERVICE"
-        ] = spark_service_name
-        self._env_config["V3IO_API"] = f"https://{v3io_api_host}"
-
-    def _install_dev_utilities(self):
-        list_uninstall = [
-            "dev_utilities.py",
-            "uninstall",
-            "--redis",
-            "--mysql",
-            "--redisinsight",
-            "--kafka",
-        ]
-        list_install = [
-            "dev_utilities.py",
-            "install",
-            "--redis",
-            "--mysql",
-            "--redisinsight",
-            "--kafka",
-            "--ipadd",
-            os.environ.get("IP_ADDR_PREFIX", "localhost"),
-        ]
-        self._run_command("rm", args=["-rf", "/home/iguazio/dev_utilities"])
-        self._run_command("python3", args=list_uninstall, workdir="/home/iguazio/")
-        self._run_command("python3", args=list_install, workdir="/home/iguazio/")
-
-    def _download_provctl(self):
-        # extract bucket name, object name from s3 file path
-        # https://<bucket-name>.s3.amazonaws.com/<object-name>
-        # s3://<bucket-name>/<object-name>
-        parsed_url = urllib.parse.urlparse(self._provctl_download_url)
-        if self._provctl_download_url.startswith("s3://"):
-            object_name = parsed_url.path.lstrip("/")
-            bucket_name = parsed_url.netloc
-        else:
-            object_name = parsed_url.path.lstrip("/")
-            bucket_name = parsed_url.netloc.split(".")[0]
-        # download provctl from s3
-        with tempfile.NamedTemporaryFile() as local_provctl_path:
-            self._logger.log(
-                "debug",
-                "Downloading provctl",
-                bucket_name=bucket_name,
-                object_name=object_name,
-                local_path=local_provctl_path.name,
-            )
-            s3_client = boto3.client(
-                "s3",
-                aws_secret_access_key=self._provctl_download_s3_access_key,
-                aws_access_key_id=self._provctl_download_s3_key_id,
-            )
-            s3_client.download_file(bucket_name, object_name, local_provctl_path.name)
-            # upload provctl to data node
-            self._logger.log(
-                "debug",
-                "Uploading provctl to datanode",
-                remote_path=str(self.Constants.provctl_path),
-                local_path=local_provctl_path.name,
-            )
-            sftp_client = self._ssh_client.open_sftp()
-            sftp_client.put(local_provctl_path.name, str(self.Constants.provctl_path))
-            sftp_client.close()
-        # make provctl executable
-        self._run_command("chmod", args=["+x", str(self.Constants.provctl_path)])
-
-    def _run_and_wait_until_successful(
-        self,
-        command: str,
-        command_name: str,
-        max_retries: int = 60,
-        interval: int = 10,
-        suppress_error_strings: list = None,
-    ):
-        finished = False
-        retries = 0
-        start_time = datetime.datetime.now()
-        while not finished and retries < max_retries:
-            try:
-                self._run_command(
-                    command,
-                    verbose=False,
-                    suppress_error_strings=suppress_error_strings,
-                )
-                finished = True
-
-            except Exception as exc:
-                self._logger.log(
-                    "debug",
-                    f"Command {command_name} didn't complete yet, trying again in {interval} seconds",
-                    retry_number=retries,
-                    exc=exc,
-                )
-                retries += 1
-                time.sleep(interval)
-
-        if retries >= max_retries and not finished:
-            self._logger.log(
-                "info",
-                f"Command {command_name} timeout passed and not finished, failing...",
-            )
-            raise RuntimeError("Command timeout passed and not finished")
-        total_seconds_took = (datetime.datetime.now() - start_time).total_seconds()
-        self._logger.log(
-            "info",
-            f"Command {command_name} took {total_seconds_took} seconds to finish",
-        )
-
-    def _patch_mlrun(self):
-        time_string = time.strftime("%Y%m%d-%H%M%S")
-        self._logger.log(
-            "debug", "Creating mlrun patch archive", mlrun_version=self._mlrun_version
-        )
-        mlrun_archive = f"./mlrun-{self._mlrun_version}.tar"
-
-        override_image_arg = ""
-        if self._override_mlrun_images:
-            override_image_arg = f"--override-images {self._override_mlrun_images}"
-
-        provctl_create_patch_log = f"/tmp/provctl-create-patch-{time_string}.log"
-        self._run_command(
-            str(self.Constants.provctl_path),
-            args=[
-                "--verbose",
-                f"--logger-file-path={provctl_create_patch_log}",
-                "create-patch",
-                "appservice",
-                override_image_arg,
-                "--gzip-flag=-1",
-                "-v",
-                f"--target-iguazio-version={str(self._iguazio_version)}",
-                "mlrun",
-                self._mlrun_version,
-                mlrun_archive,
-            ],
-            detach=True,
-        )
-        self._run_and_wait_until_successful(
-            command=f"grep 'Patch archive prepared' {provctl_create_patch_log}",
-            command_name="provctl create patch",
-            max_retries=25,
-            interval=60,
-        )
-        # print provctl create patch log
-        self._run_command(f"cat {provctl_create_patch_log}")
-
-        self._logger.log(
-            "info", "Patching MLRun version", mlrun_version=self._mlrun_version
-        )
-        provctl_patch_mlrun_log = f"/tmp/provctl-patch-mlrun-{time_string}.log"
-        self._run_command(
-            str(self.Constants.provctl_path),
-            args=[
-                "--verbose",
-                f"--logger-file-path={provctl_patch_mlrun_log}",
-                "--app-cluster-password",
-                self._app_cluster_ssh_password,
-                "--data-cluster-password",
-                self._data_cluster_ssh_password,
-                "patch",
-                "appservice",
-                # we force because by default provctl doesn't allow downgrading between version but due to system tests
-                # running on multiple branches this might occur.
-                "--force",
-                "mlrun",
-                mlrun_archive,
-                # enable audit events - will be ignored by provctl if mlrun version does not support it
-                # TODO: remove when setup is upgraded to iguazio version >= 3.5.4 since audit events
-                #  are enabled by default
-                "--feature-gates",
-                "mlrun.auditevents=enabled",
-            ],
-            detach=True,
-        )
-        self._run_and_wait_until_successful(
-            command=f"grep 'Finished patching appservice' {provctl_patch_mlrun_log}",
-            command_name="provctl patch mlrun",
-            max_retries=25,
-            interval=60,
-        )
-        # print provctl patch mlrun log
-        self._run_command(f"cat {provctl_patch_mlrun_log}")
-
-    def _resolve_iguazio_version(self):
-        # iguazio version is optional, if not provided, we will try to resolve it from the data node
-        if not self._iguazio_version:
-            self._logger.log("info", "Resolving iguazio version")
-            self._iguazio_version, _ = self._run_command(
-                f"cat {self.Constants.igz_version_file}",
-                verbose=False,
-                live=False,
-            )
-            self._iguazio_version = self._iguazio_version.strip().decode()
-        self._logger.log(
-            "info", "Resolved iguazio version", iguazio_version=self._iguazio_version
-        )
-
-    def _purge_mlrun_db(self):
-        """
-        Purge mlrun db - exec into mlrun-db pod, delete the database and scale down mlrun pods
-        """
-        self._delete_mlrun_db()
-        self._scale_down_mlrun_deployments()
-
-    def _delete_mlrun_db(self):
-        self._logger.log("info", "Deleting mlrun db")
-
-        mlrun_db_pod_name_cmd = self._get_pod_name_command(
-            labels={
-                "app.kubernetes.io/component": "db",
-                "app.kubernetes.io/instance": "mlrun",
-            },
-        )
-        if not mlrun_db_pod_name_cmd:
-            self._logger.log("info", "No mlrun db pod found")
-            return
-
-        self._logger.log(
-            "info", "Deleting mlrun db pod", mlrun_db_pod_name_cmd=mlrun_db_pod_name_cmd
-        )
-
-        password = ""
-        if self._mysql_password:
-            password = f"-p {self._mysql_password} "
-
-        drop_db_cmd = f"mysql --socket=/run/mysqld/mysql.sock -u {self._mysql_user} {password}-e 'DROP DATABASE mlrun;'"
-
-        args = [
-            "kubectl",
-            "exec",
-            "-n",
-            self.Constants.namespace,
-            "-it",
-            mlrun_db_pod_name_cmd,
-            "--",
-            drop_db_cmd,
-        ]
-        command = " ".join(args)
-        self._run_and_wait_until_successful(
-            command,
-            command_name="delete mlrun db",
-            max_retries=5,
-            interval=10,
-            suppress_error_strings=["database doesn\\'t exist"],
-        )
-
-    def _get_pod_name_command(self, labels):
-        labels_selector = ",".join([f"{k}={v}" for k, v in labels.items()])
-        pod_name, stderr = self._run_kubectl_command(
-            args=[
-                "get",
-                "pods",
-                "--namespace",
-                self.Constants.namespace,
-                "--selector",
-                labels_selector,
-                "|",
-                "tail",
-                "-n",
-                "1",
-                "|",
-                "awk",
-                "'{print $1}'",
-            ],
-        )
-        if b"No resources found" in stderr or not pod_name:
-            return None
-        return pod_name.strip()
-
-    def _scale_down_mlrun_deployments(self):
-        # scaling down to avoid automatically deployments restarts and failures
-        self._logger.log("info", "scaling down mlrun deployments")
-        self._run_kubectl_command(
-            args=[
-                "scale",
-                "deployment",
-                "-n",
-                self.Constants.namespace,
-                "mlrun-api-chief",
-                "mlrun-api-worker",
-                "mlrun-db",
-                "--replicas=0",
-            ]
-        )
-
-    def _run_kubectl_command(self, args, verbose=True, suppress_error_strings=None):
-        return self._run_command(
-            command="kubectl",
-            args=args,
-            verbose=verbose,
-            suppress_error_strings=suppress_error_strings,
-        )
-
-    def _serialize_env_config(self, allow_none_values: bool = False):
-        env_config = self._env_config.copy()
-
-        # we sanitize None values from config to avoid "null" values in yaml
-        if not allow_none_values:
-            for key in list(env_config):
-                if env_config[key] is None:
-                    del env_config[key]
-
-        return yaml.safe_dump(env_config)
-
-    def _get_ingress_host(self, ingress_name: str):
-        host, stderr = self._run_kubectl_command(
-            args=[
-                "get",
-                "ingress",
-                "--namespace",
-                self.Constants.namespace,
-                ingress_name,
-                "--output",
-                "jsonpath={'@.spec.rules[0].host'}",
-            ],
-        )
-        if stderr:
-            raise RuntimeError(
-                f"Failed getting {ingress_name} ingress host. Error: {stderr}"
-            )
-        return host.strip()
-
-    def _get_service_name(self, label_selector):
-        service_name, stderr = self._run_kubectl_command(
-            args=[
-                "get",
-                "deployment",
-                "--namespace",
-                self.Constants.namespace,
-                "-l",
-                label_selector,
-                "--output",
-                "jsonpath={'@.items[0].metadata.labels.release'}",
-            ],
-        )
-        if stderr:
-            raise RuntimeError(f"Failed getting service name. Error: {stderr}")
-        return service_name.strip()
-
-    def _get_devutils_status(self):
-        out, err = "", ""
-        try:
-            out, err = self._run_command(
-                "python3",
-                [
-                    "/home/iguazio/dev_utilities.py",
-                    "status",
-                    "--redis",
-                    "--kafka",
-                    "--mysql",
-                    "--redisinsight",
-                    "--output",
-                    "json",
-                ],
-            )
-        except Exception as exc:
-            self._logger.log(
-                "warning", "Failed to enrich env", exc=exc, err=err, out=out
-            )
-
-        return json.loads(out or "{}")
-
-    def _ensure_ssh_session_active(self):
-        self._logger.log("info", "Ensuring ssh session is active")
-        try:
-            self._ssh_client.exec_command("ls > /dev/null")
-        except Exception as exc:
-            exc_msg = str(exc)
-            self._logger.log("warning", "Failed to execute command", exc=exc_msg)
-            if any(
-                map(
-                    lambda err_msg: err_msg.lower() in exc_msg.lower(),
-                    [
-                        "No existing session",
-                        "session not active",
-                        "Unable to connect to",
-                    ],
-                )
-            ):
-                self._logger.log("info", "Reconnecting to remote")
-                self.connect_to_remote()
-                self._logger.log("info", "Reconnected to remote")
-                return
-            raise
-        self._logger.log("info", "SSH session is active")
+        return dict
+    if svc == "redisinsight":
+        fqdn = get_ingress_controller_version()
+        full_domain = "https://redisinsight" + fqdn
+        dict = {"app_url": full_domain}
+        return dict
 
 
 @click.group()
-def main():
+def cli():
     pass
 
 
-@main.command(context_settings=dict(ignore_unknown_options=True))
-@click.option("--mlrun-version")
-@click.option(
-    "--override-image-registry",
-    "-oireg",
-    default=None,
-    help="Override default mlrun docker image registry.",
-)
-@click.option(
-    "--override-image-repo",
-    "-oirep",
-    default=None,
-    help="Override default mlrun docker image repository name.",
-)
-@click.option(
-    "--override-mlrun-images",
-    "-omi",
-    default=None,
-    help="Override default images (comma delimited list).",
-)
-@click.option(
-    "--mlrun-commit",
-    "-mc",
-    default=None,
-    help="The commit (in mlrun/mlrun) of the tested mlrun version.",
-)
-@click.option("--data-cluster-ip", required=True)
-@click.option("--data-cluster-ssh-username", required=True)
-@click.option("--data-cluster-ssh-password", required=True)
-@click.option("--app-cluster-ssh-password", required=True)
-@click.option("--provctl-download-url", required=True)
-@click.option("--provctl-download-s3-access-key", required=True)
-@click.option("--provctl-download-s3-key-id", required=True)
-@click.option("--username", required=True)
-@click.option("--access-key", required=True)
-@click.option("--iguazio-version", default=None)
-@click.option("--mysql-user")
-@click.option("--mysql-password")
-@click.option("--purge-db", "-pdb", is_flag=True, help="Purge mlrun db")
-@click.option(
-    "--debug",
-    "-d",
-    is_flag=True,
-    help="Don't run the ci only show the commands that will be run",
-)
-def run(
-    mlrun_version: str,
-    mlrun_commit: str,
-    override_image_registry: str,
-    override_image_repo: str,
-    override_mlrun_images: str,
-    data_cluster_ip: str,
-    data_cluster_ssh_username: str,
-    data_cluster_ssh_password: str,
-    app_cluster_ssh_password: str,
-    provctl_download_url: str,
-    provctl_download_s3_access_key: str,
-    provctl_download_s3_key_id: str,
-    username: str,
-    access_key: str,
-    iguazio_version: str,
-    mysql_user: str,
-    mysql_password: str,
-    purge_db: bool,
-    debug: bool,
-):
-    system_test_preparer = SystemTestPreparer(
-        mlrun_version=mlrun_version,
-        mlrun_commit=mlrun_commit,
-        override_image_registry=override_image_registry,
-        override_image_repo=override_image_repo,
-        override_mlrun_images=override_mlrun_images,
-        data_cluster_ip=data_cluster_ip,
-        data_cluster_ssh_username=data_cluster_ssh_username,
-        data_cluster_ssh_password=data_cluster_ssh_password,
-        app_cluster_ssh_password=app_cluster_ssh_password,
-        provctl_download_url=provctl_download_url,
-        provctl_download_s3_access_key=provctl_download_s3_access_key,
-        provctl_download_s3_key_id=provctl_download_s3_key_id,
-        username=username,
-        access_key=access_key,
-        iguazio_version=iguazio_version,
-        mysql_user=mysql_user,
-        mysql_password=mysql_password,
-        purge_db=purge_db,
-        debug=debug,
-    )
-    try:
-        system_test_preparer.run()
-    except Exception as exc:
-        logger.log("error", "Failed running system test automation", exc=exc)
-        raise
-
-
-@main.command(context_settings=dict(ignore_unknown_options=True))
-@click.option("--mlrun-dbpath", help="The mlrun api address", required=True)
-@click.option("--data-cluster-ip")
-@click.option("--data-cluster-ssh-username")
-@click.option("--data-cluster-ssh-password")
-@click.option("--username", help="Iguazio running username")
-@click.option("--access-key", help="Iguazio running user access key")
-@click.option(
-    "--slack-webhook-url", help="Slack webhook url to send tests notifications to"
-)
-@click.option(
-    "--debug",
-    "-d",
-    is_flag=True,
-    help="Don't run the ci only show the commands that will be run",
-)
-@click.option("--branch", help="The mlrun branch to run the tests against")
-@click.option(
-    "--github-access-token",
-    help="Github access token to use for fetching private functions",
-)
-@click.option(
-    "--save-to-path",
-    help="Path to save the compiled env file to",
-)
-def env(
-    data_cluster_ip: str,
-    data_cluster_ssh_username: str,
-    data_cluster_ssh_password: str,
-    mlrun_dbpath: str,
-    username: str,
-    access_key: str,
-    slack_webhook_url: str,
-    debug: bool,
-    branch: str,
-    github_access_token: str,
-    save_to_path: str,
-):
-    system_test_preparer = SystemTestPreparer(
-        data_cluster_ip=data_cluster_ip,
-        data_cluster_ssh_password=data_cluster_ssh_password,
-        data_cluster_ssh_username=data_cluster_ssh_username,
-        mlrun_dbpath=mlrun_dbpath,
-        username=username,
-        access_key=access_key,
-        debug=debug,
-        slack_webhook_url=slack_webhook_url,
-        branch=branch,
-        github_access_token=github_access_token,
-    )
-    try:
-        system_test_preparer.connect_to_remote()
-        system_test_preparer.prepare_local_env(save_to_path)
-    except Exception as exc:
-        logger.log("error", "Failed preparing local system test environment", exc=exc)
-        raise
-
-
-def run_command(
-    command: str,
-    args: list = None,
-    workdir: str = None,
-    stdin: str = None,
-    live: bool = True,
-    log_file_handler: typing.IO[str] = None,
-) -> (str, str, int):
-    if workdir:
-        command = f"cd {workdir}; " + command
-    if args:
-        command += " " + " ".join(args)
-
-    process = subprocess.Popen(
-        command,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        stdin=subprocess.PIPE,
-        shell=True,
-    )
-
-    if stdin:
-        process.stdin.write(bytes(stdin, "ascii"))
-        process.stdin.close()
-
-    stdout = _handle_command_stdout(process.stdout, log_file_handler, live)
-    stderr = process.stderr.read()
-    exit_status = process.wait()
-
-    return stdout, stderr, exit_status
-
-
-def _handle_command_stdout(
-    stdout_stream: typing.IO[bytes],
-    log_file_handler: typing.IO[str] = None,
-    live: bool = True,
-) -> str:
-    def _write_to_log_file(text: bytes):
-        if log_file_handler:
-            log_file_handler.write(text.decode(sys.stdout.encoding))
-
-    stdout = ""
-    if live:
-        for line in iter(stdout_stream.readline, b""):
-            stdout += str(line)
-            sys.stdout.write(line.decode(sys.stdout.encoding))
-            _write_to_log_file(line)
-    else:
-        stdout = stdout_stream.read()
-        _write_to_log_file(stdout)
-
-    return stdout
-
+cli.add_command(install)
+cli.add_command(uninstall)
+cli.add_command(list_services)
+cli.add_command(status)
 
 if __name__ == "__main__":
-    main()
+    cli()
