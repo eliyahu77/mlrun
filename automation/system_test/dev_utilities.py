@@ -201,7 +201,7 @@ def install_redisinsight(ipadd):
         pfull_domain = "https://" + full_domain
         env_vars = [
             {"name": "RITRUSTEDORIGINS", "value": pfull_domain},
-            {"name": "RIPROXYENABLE", "value": "true"},
+            {"name": "RIPROXYENABLE", "value": "true"}
         ]
         add_env_to_deployment(
             namespace="devtools", deployment_name=deployment_name, env_vars=env_vars
